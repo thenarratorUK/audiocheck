@@ -24,7 +24,7 @@ def _fmt_time_hh(seconds: float, decimals: int = 2) -> str:
     seconds = max(0.0, float(seconds))
     m, s = divmod(seconds, 60.0)
     h, m = divmod(m, 60.0)
-    s_fmt = f"{s:0{2 + 1 + decimals}.{decimals}f}"  # zero-padded seconds with decimals
+    s_fmt = f"{s:0{2 + 1 + decimals}.{decimals}f}"
     return f"{int(h):02d}:{int(m):02d}:{s_fmt}"
 
 def _events_to_csv_bytes(events: list[dict]) -> bytes:
@@ -56,28 +56,28 @@ def _state_path(user_key: str) -> Path:
 def _audio_dir(user_key: str) -> Path:
     return _user_dir(user_key) / "audio"
 
+def _default_state() -> dict:
+    return {
+        "events": [],
+        "last_time_by_audio": {},
+        "duration_by_audio": {},
+        "audio_files": {},            # audio_id -> {"name":..., "path":...}
+        "last_audio_id": None,
+        "pending_start_by_audio": {}, # audio_id -> float (apply once on next render)
+    }
+
 def _load_state(user_key: str) -> dict:
     p = _state_path(user_key)
     if not p.exists():
-        return {
-            "events": [],
-            "last_time_by_audio": {},
-            "duration_by_audio": {},
-            "audio_files": {},          # audio_id -> {"name":..., "path":...}
-            "last_audio_id": None,
-            "start_base_by_audio": {},  # audio_id -> float (used for "jump"/resume)
-        }
+        return _default_state()
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
+        # Backwards compatibility with older state formats.
+        for k, v in _default_state().items():
+            data.setdefault(k, v)
+        return data
     except Exception:
-        return {
-            "events": [],
-            "last_time_by_audio": {},
-            "duration_by_audio": {},
-            "audio_files": {},
-            "last_audio_id": None,
-            "start_base_by_audio": {},
-        }
+        return _default_state()
 
 def _save_state(user_key: str, state: dict) -> None:
     p = _state_path(user_key)
@@ -95,7 +95,7 @@ def _persist_now(user_key: str) -> None:
             "duration_by_audio": st.session_state["duration_by_audio"],
             "audio_files": st.session_state["audio_files"],
             "last_audio_id": st.session_state.get("last_audio_id"),
-            "start_base_by_audio": st.session_state["start_base_by_audio"],
+            "pending_start_by_audio": st.session_state["pending_start_by_audio"],
         },
     )
 
@@ -178,7 +178,7 @@ st.session_state.setdefault("events", state.get("events", []))
 st.session_state.setdefault("last_time_by_audio", state.get("last_time_by_audio", {}))
 st.session_state.setdefault("duration_by_audio", state.get("duration_by_audio", {}))
 st.session_state.setdefault("audio_files", state.get("audio_files", {}))
-st.session_state.setdefault("start_base_by_audio", state.get("start_base_by_audio", {}))
+st.session_state.setdefault("pending_start_by_audio", state.get("pending_start_by_audio", {}))
 st.session_state.setdefault("last_audio_id", state.get("last_audio_id"))
 
 # -----------------------------
@@ -207,7 +207,6 @@ if uploaded is not None:
         if dur is not None:
             st.session_state["duration_by_audio"][audio_id] = float(dur)
 
-    st.session_state["start_base_by_audio"].setdefault(audio_id, 0.0)
     _persist_now(user_key)
 
 # If no upload on this run, allow selecting a previously stored file for this key
@@ -233,21 +232,20 @@ if audio_id is None and st.session_state["audio_files"]:
 if audio_id and audio_path:
     last_time = float(st.session_state["last_time_by_audio"].get(audio_id, 0.0))
     duration = st.session_state["duration_by_audio"].get(audio_id)
-    start_base = float(st.session_state["start_base_by_audio"].get(audio_id, 0.0))
 
     st.subheader("Player")
 
-    # Controls: jump / resume
+    # Jump controls: implemented as a one-shot start_time override.
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("Jump to last played time", width="stretch"):
-            st.session_state["start_base_by_audio"][audio_id] = float(int(last_time))
+            st.session_state["pending_start_by_audio"][audio_id] = float(int(last_time))
             _persist_now(user_key)
             st.rerun()
 
     with c2:
         if st.button("Jump to 00:00:00.00", width="stretch"):
-            st.session_state["start_base_by_audio"][audio_id] = 0.0
+            st.session_state["pending_start_by_audio"][audio_id] = 0.0
             _persist_now(user_key)
             st.rerun()
 
@@ -257,26 +255,32 @@ if audio_id and audio_path:
         else:
             st.caption(f"Last played: {_fmt_time_hh(last_time)}")
 
-    from streamlit_advanced_audio import audix, WaveSurferOptions
+    # IMPORTANT:
+    # Passing start_time on every rerun can override user seeking via the waveform.
+    # So we only pass start_time when a jump has been explicitly requested (pending_start_by_audio).
+    pending = st.session_state["pending_start_by_audio"].get(audio_id)
 
-    ws_opts = WaveSurferOptions(height=60, bar_width=2, bar_gap=1)
+    from streamlit_advanced_audio import audix
 
-    result = audix(
-        audio_path,
-        start_time=start_base,
-        wavesurfer_options=ws_opts,
-    )
+    if pending is None:
+        result = audix(audio_path)
+    else:
+        result = audix(audio_path, start_time=pending)
+        # Clear the one-shot override so waveform click/drag seeking works normally afterwards.
+        st.session_state["pending_start_by_audio"].pop(audio_id, None)
+        _persist_now(user_key)
+
+    # If the component reports time, capture it (typically updates on pause/seek/user interaction).
+    if isinstance(result, dict) and "currentTime" in result:
+        last_time = float(result["currentTime"])
+        st.session_state["last_time_by_audio"][audio_id] = last_time
+        _persist_now(user_key)
 
     # Friendly time readout under the player
     if duration is not None:
         st.caption(f"Current: {_fmt_time_hh(last_time)} / {_fmt_time_hh(float(duration))}")
     else:
         st.caption(f"Current: {_fmt_time_hh(last_time)}")
-
-    if isinstance(result, dict) and "currentTime" in result:
-        last_time = float(result["currentTime"])
-        st.session_state["last_time_by_audio"][audio_id] = last_time
-        _persist_now(user_key)
 
     st.subheader("Log an issue")
     note = st.text_input("Optional note", value="", placeholder="e.g., hard T / rustle / long pause")
