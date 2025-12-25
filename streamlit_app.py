@@ -2,7 +2,6 @@ import csv
 import io
 import json
 import time
-import tempfile
 import hashlib
 import wave
 from pathlib import Path
@@ -14,16 +13,18 @@ st.set_page_config(page_title="Bed Proofing Logger", layout="wide")
 
 LABELS = ["Breath", "Pop", "Noise", "Click", "Plosive", "Mouth", "Other"]
 
-DATA_ROOT = Path("data")  # persisted while the Streamlit Cloud container stays alive
+DATA_ROOT = Path("data")  # best-effort persistence on Streamlit Cloud while container stays alive
 
+# -----------------------------
+# Formatting
+# -----------------------------
 def _fmt_time_hh(seconds: float, decimals: int = 2) -> str:
     if seconds is None:
         seconds = 0.0
     seconds = max(0.0, float(seconds))
     m, s = divmod(seconds, 60.0)
     h, m = divmod(m, 60.0)
-    # Seconds with fixed decimals and leading zero padding
-    s_fmt = f"{s:0{2 + 1 + decimals}.{decimals}f}"  # e.g. 13.99
+    s_fmt = f"{s:0{2 + 1 + decimals}.{decimals}f}"  # zero-padded seconds with decimals
     return f"{int(h):02d}:{int(m):02d}:{s_fmt}"
 
 def _events_to_csv_bytes(events: list[dict]) -> bytes:
@@ -35,6 +36,9 @@ def _events_to_csv_bytes(events: list[dict]) -> bytes:
         writer.writerow(row)
     return buf.getvalue().encode("utf-8")
 
+# -----------------------------
+# Persistence
+# -----------------------------
 def _safe_key(s: str) -> str:
     s = (s or "").strip()
     keep = []
@@ -43,17 +47,37 @@ def _safe_key(s: str) -> str:
             keep.append(ch)
     return "".join(keep)[:64]
 
+def _user_dir(user_key: str) -> Path:
+    return DATA_ROOT / user_key
+
 def _state_path(user_key: str) -> Path:
-    return DATA_ROOT / user_key / "state.json"
+    return _user_dir(user_key) / "state.json"
+
+def _audio_dir(user_key: str) -> Path:
+    return _user_dir(user_key) / "audio"
 
 def _load_state(user_key: str) -> dict:
     p = _state_path(user_key)
     if not p.exists():
-        return {"events": [], "last_time_by_audio": {}, "duration_by_audio": {}}
+        return {
+            "events": [],
+            "last_time_by_audio": {},
+            "duration_by_audio": {},
+            "audio_files": {},          # audio_id -> {"name":..., "path":...}
+            "last_audio_id": None,
+            "start_base_by_audio": {},  # audio_id -> float (used for "jump"/resume)
+        }
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return {"events": [], "last_time_by_audio": {}, "duration_by_audio": {}}
+        return {
+            "events": [],
+            "last_time_by_audio": {},
+            "duration_by_audio": {},
+            "audio_files": {},
+            "last_audio_id": None,
+            "start_base_by_audio": {},
+        }
 
 def _save_state(user_key: str, state: dict) -> None:
     p = _state_path(user_key)
@@ -62,19 +86,40 @@ def _save_state(user_key: str, state: dict) -> None:
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(p)
 
-def _write_uploaded_to_temp(uploaded) -> tuple[str, str, str]:
-    """Return (audio_name, audio_path, audio_id). audio_id is sha1(name+bytes)."""
+def _persist_now(user_key: str) -> None:
+    _save_state(
+        user_key,
+        {
+            "events": st.session_state["events"],
+            "last_time_by_audio": st.session_state["last_time_by_audio"],
+            "duration_by_audio": st.session_state["duration_by_audio"],
+            "audio_files": st.session_state["audio_files"],
+            "last_audio_id": st.session_state.get("last_audio_id"),
+            "start_base_by_audio": st.session_state["start_base_by_audio"],
+        },
+    )
+
+# -----------------------------
+# Audio utilities
+# -----------------------------
+def _hash_upload(name: str, data: bytes) -> str:
+    return hashlib.sha1(name.encode("utf-8") + b"\0" + data).hexdigest()[:16]
+
+def _store_uploaded_audio(user_key: str, uploaded) -> tuple[str, str, str]:
+    """Return (audio_name, audio_path, audio_id). Stores under data/<key>/audio/ so refresh can reuse."""
     audio_name = uploaded.name
-    suffix = Path(audio_name).suffix or ".mp3"
-
     data = uploaded.getvalue()
-    digest = hashlib.sha1(audio_name.encode("utf-8") + b"\0" + data).hexdigest()[:16]
-    out_path = Path(tempfile.gettempdir()) / f"proofing_audio_{digest}{suffix}"
+    audio_id = _hash_upload(audio_name, data)
 
+    ext = (Path(audio_name).suffix or ".mp3").lower()
+    out_dir = _audio_dir(user_key)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = out_dir / f"{audio_id}{ext}"
     if not out_path.exists():
         out_path.write_bytes(data)
 
-    return audio_name, str(out_path), digest
+    return audio_name, str(out_path), audio_id
 
 def _get_duration_seconds(audio_path: str) -> float | None:
     p = Path(audio_path)
@@ -102,11 +147,10 @@ def _get_duration_seconds(audio_path: str) -> float | None:
     return None
 
 # -----------------------------
-# User key "page"
+# User key gate
 # -----------------------------
 st.title("Proofing Logger (tap-to-mark)")
 
-# Persist the key in the URL so refresh keeps it.
 q = st.query_params
 existing_key = q.get("k", "")
 
@@ -127,24 +171,18 @@ if not existing_key:
 user_key = _safe_key(existing_key)
 st.caption(f"User key: {user_key}")
 
-# Load persisted state
+# Load persisted state into session_state
 state = _load_state(user_key)
+
 st.session_state.setdefault("events", state.get("events", []))
 st.session_state.setdefault("last_time_by_audio", state.get("last_time_by_audio", {}))
 st.session_state.setdefault("duration_by_audio", state.get("duration_by_audio", {}))
-
-def _persist_now():
-    _save_state(
-        user_key,
-        {
-            "events": st.session_state["events"],
-            "last_time_by_audio": st.session_state["last_time_by_audio"],
-            "duration_by_audio": st.session_state["duration_by_audio"],
-        },
-    )
+st.session_state.setdefault("audio_files", state.get("audio_files", {}))
+st.session_state.setdefault("start_base_by_audio", state.get("start_base_by_audio", {}))
+st.session_state.setdefault("last_audio_id", state.get("last_audio_id"))
 
 # -----------------------------
-# Main UI
+# Choose / upload audio
 # -----------------------------
 uploaded = st.file_uploader(
     "Upload audio (MP3/WAV).",
@@ -157,48 +195,88 @@ audio_name = None
 audio_id = None
 
 if uploaded is not None:
-    with st.spinner("Preparing audio…"):
-        audio_name, audio_path, audio_id = _write_uploaded_to_temp(uploaded)
-    st.session_state["current_audio_name"] = audio_name
-    st.session_state["current_audio_path"] = audio_path
-    st.session_state["current_audio_id"] = audio_id
+    with st.spinner("Storing audio for refresh-safe playback…"):
+        audio_name, audio_path, audio_id = _store_uploaded_audio(user_key, uploaded)
+
+    st.session_state["audio_files"][audio_id] = {"name": audio_name, "path": audio_path}
+    st.session_state["last_audio_id"] = audio_id
 
     if audio_id not in st.session_state["duration_by_audio"]:
         with st.spinner("Reading duration…"):
             dur = _get_duration_seconds(audio_path)
         if dur is not None:
             st.session_state["duration_by_audio"][audio_id] = float(dur)
-            _persist_now()
-else:
-    audio_name = st.session_state.get("current_audio_name")
-    audio_path = st.session_state.get("current_audio_path")
-    audio_id = st.session_state.get("current_audio_id")
 
-last_time = 0.0
-duration = None
+    st.session_state["start_base_by_audio"].setdefault(audio_id, 0.0)
+    _persist_now(user_key)
 
-if audio_id:
+# If no upload on this run, allow selecting a previously stored file for this key
+if audio_id is None and st.session_state["audio_files"]:
+    ids = list(st.session_state["audio_files"].keys())
+    last_id = st.session_state.get("last_audio_id")
+    default_idx = ids.index(last_id) if (last_id in ids) else 0
+
+    options = [(aid, st.session_state["audio_files"][aid]["name"]) for aid in ids]
+    labels = [name for _, name in options]
+    picked_name = st.selectbox("Previously stored for this key", labels, index=default_idx)
+
+    picked_id = options[labels.index(picked_name)][0]
+    audio_id = picked_id
+    audio_name = st.session_state["audio_files"][picked_id]["name"]
+    audio_path = st.session_state["audio_files"][picked_id]["path"]
+    st.session_state["last_audio_id"] = picked_id
+    _persist_now(user_key)
+
+# -----------------------------
+# Player + logging
+# -----------------------------
+if audio_id and audio_path:
     last_time = float(st.session_state["last_time_by_audio"].get(audio_id, 0.0))
     duration = st.session_state["duration_by_audio"].get(audio_id)
+    start_base = float(st.session_state["start_base_by_audio"].get(audio_id, 0.0))
 
-if audio_path:
     st.subheader("Player")
 
-    # Lazy import so first paint is fast.
-    from streamlit_advanced_audio import audix
+    # Controls: jump / resume
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Jump to last played time", width="stretch"):
+            st.session_state["start_base_by_audio"][audio_id] = float(int(last_time))
+            _persist_now(user_key)
+            st.rerun()
 
-    result = audix(audio_path)
+    with c2:
+        if st.button("Jump to 00:00:00.00", width="stretch"):
+            st.session_state["start_base_by_audio"][audio_id] = 0.0
+            _persist_now(user_key)
+            st.rerun()
+
+    with c3:
+        if duration is not None:
+            st.caption(f"Last played: {_fmt_time_hh(last_time)} / {_fmt_time_hh(duration)}")
+        else:
+            st.caption(f"Last played: {_fmt_time_hh(last_time)}")
+
+    from streamlit_advanced_audio import audix, WaveSurferOptions
+
+    ws_opts = WaveSurferOptions(height=60, bar_width=2, bar_gap=1)
+
+    result = audix(
+        audio_path,
+        start_time=start_base,
+        wavesurfer_options=ws_opts,
+    )
+
+    # Friendly time readout under the player
+    if duration is not None:
+        st.caption(f"Current: {_fmt_time_hh(last_time)} / {_fmt_time_hh(float(duration))}")
+    else:
+        st.caption(f"Current: {_fmt_time_hh(last_time)}")
+
     if isinstance(result, dict) and "currentTime" in result:
-        # This typically updates reliably on pause / user interaction.
         last_time = float(result["currentTime"])
         st.session_state["last_time_by_audio"][audio_id] = last_time
-        _persist_now()
-
-    # Keep the component's own display, but show a friendlier time readout underneath.
-    if duration is not None:
-        st.caption(f"{_fmt_time_hh(last_time)}/{_fmt_time_hh(duration)}")
-    else:
-        st.caption(f"{_fmt_time_hh(last_time)}")
+        _persist_now(user_key)
 
     st.subheader("Log an issue")
     note = st.text_input("Optional note", value="", placeholder="e.g., hard T / rustle / long pause")
@@ -220,7 +298,7 @@ if audio_path:
                 "logged_at_epoch": time.time(),
             }
         )
-        _persist_now()
+        _persist_now(user_key)
 
 st.divider()
 
@@ -237,16 +315,16 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     if st.button("Undo last", width="stretch") and st.session_state["events"]:
         st.session_state["events"].pop()
-        _persist_now()
+        _persist_now(user_key)
 
 with c2:
     if st.button("Clear all", width="stretch"):
         st.session_state["events"] = []
-        _persist_now()
+        _persist_now(user_key)
 
 with c3:
     if st.button("Force save", width="stretch"):
-        _persist_now()
+        _persist_now(user_key)
         st.success("Saved.")
 
 with c4:
@@ -259,4 +337,4 @@ with c4:
             width="stretch",
         )
 
-st.caption("Tip: bookmark this page URL — it includes your user key, so refresh will restore your log.")
+st.caption("Tip: bookmark this page URL — it includes your user key, so refresh will restore your log and your uploaded audio.")
