@@ -4,9 +4,11 @@ import json
 import time
 import tempfile
 import hashlib
+import wave
 from pathlib import Path
 
 import streamlit as st
+from mutagen import File as MutagenFile
 
 st.set_page_config(page_title="Bed Proofing Logger", layout="wide")
 
@@ -14,15 +16,15 @@ LABELS = ["Breath", "Pop", "Noise", "Click", "Plosive", "Mouth", "Other"]
 
 DATA_ROOT = Path("data")  # persisted while the Streamlit Cloud container stays alive
 
-def _fmt_time(seconds: float) -> str:
+def _fmt_time_hh(seconds: float, decimals: int = 2) -> str:
     if seconds is None:
-        return ""
+        seconds = 0.0
     seconds = max(0.0, float(seconds))
     m, s = divmod(seconds, 60.0)
     h, m = divmod(m, 60.0)
-    if h >= 1:
-        return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
-    return f"{int(m):02d}:{s:06.3f}"
+    # Seconds with fixed decimals and leading zero padding
+    s_fmt = f"{s:0{2 + 1 + decimals}.{decimals}f}"  # e.g. 13.99
+    return f"{int(h):02d}:{int(m):02d}:{s_fmt}"
 
 def _events_to_csv_bytes(events: list[dict]) -> bytes:
     buf = io.StringIO()
@@ -47,11 +49,11 @@ def _state_path(user_key: str) -> Path:
 def _load_state(user_key: str) -> dict:
     p = _state_path(user_key)
     if not p.exists():
-        return {"events": [], "last_time_by_audio": {}}
+        return {"events": [], "last_time_by_audio": {}, "duration_by_audio": {}}
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return {"events": [], "last_time_by_audio": {}}
+        return {"events": [], "last_time_by_audio": {}, "duration_by_audio": {}}
 
 def _save_state(user_key: str, state: dict) -> None:
     p = _state_path(user_key)
@@ -73,6 +75,31 @@ def _write_uploaded_to_temp(uploaded) -> tuple[str, str, str]:
         out_path.write_bytes(data)
 
     return audio_name, str(out_path), digest
+
+def _get_duration_seconds(audio_path: str) -> float | None:
+    p = Path(audio_path)
+    ext = p.suffix.lower()
+
+    if ext == ".wav":
+        try:
+            with wave.open(str(p), "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                if rate > 0:
+                    return float(frames) / float(rate)
+        except Exception:
+            return None
+
+    try:
+        mf = MutagenFile(str(p))
+        if mf is not None and getattr(mf, "info", None) is not None:
+            length = getattr(mf.info, "length", None)
+            if length is not None:
+                return float(length)
+    except Exception:
+        return None
+
+    return None
 
 # -----------------------------
 # User key "page"
@@ -104,6 +131,17 @@ st.caption(f"User key: {user_key}")
 state = _load_state(user_key)
 st.session_state.setdefault("events", state.get("events", []))
 st.session_state.setdefault("last_time_by_audio", state.get("last_time_by_audio", {}))
+st.session_state.setdefault("duration_by_audio", state.get("duration_by_audio", {}))
+
+def _persist_now():
+    _save_state(
+        user_key,
+        {
+            "events": st.session_state["events"],
+            "last_time_by_audio": st.session_state["last_time_by_audio"],
+            "duration_by_audio": st.session_state["duration_by_audio"],
+        },
+    )
 
 # -----------------------------
 # Main UI
@@ -124,14 +162,24 @@ if uploaded is not None:
     st.session_state["current_audio_name"] = audio_name
     st.session_state["current_audio_path"] = audio_path
     st.session_state["current_audio_id"] = audio_id
+
+    if audio_id not in st.session_state["duration_by_audio"]:
+        with st.spinner("Reading duration…"):
+            dur = _get_duration_seconds(audio_path)
+        if dur is not None:
+            st.session_state["duration_by_audio"][audio_id] = float(dur)
+            _persist_now()
 else:
     audio_name = st.session_state.get("current_audio_name")
     audio_path = st.session_state.get("current_audio_path")
     audio_id = st.session_state.get("current_audio_id")
 
 last_time = 0.0
+duration = None
+
 if audio_id:
     last_time = float(st.session_state["last_time_by_audio"].get(audio_id, 0.0))
+    duration = st.session_state["duration_by_audio"].get(audio_id)
 
 if audio_path:
     st.subheader("Player")
@@ -144,15 +192,13 @@ if audio_path:
         # This typically updates reliably on pause / user interaction.
         last_time = float(result["currentTime"])
         st.session_state["last_time_by_audio"][audio_id] = last_time
+        _persist_now()
 
-        # Persist on time update (cheap and makes refresh safer).
-        state = {
-            "events": st.session_state["events"],
-            "last_time_by_audio": st.session_state["last_time_by_audio"],
-        }
-        _save_state(user_key, state)
-
-    st.caption(f"Last reported time: {_fmt_time(last_time)} ({last_time:.3f}s)")
+    # Keep the component's own display, but show a friendlier time readout underneath.
+    if duration is not None:
+        st.caption(f"{_fmt_time_hh(last_time)}/{_fmt_time_hh(duration)}")
+    else:
+        st.caption(f"{_fmt_time_hh(last_time)}")
 
     st.subheader("Log an issue")
     note = st.text_input("Optional note", value="", placeholder="e.g., hard T / rustle / long pause")
@@ -168,19 +214,13 @@ if audio_path:
             {
                 "audio_file": audio_name,
                 "time_sec": float(last_time),
-                "timecode": _fmt_time(last_time),
+                "timecode": _fmt_time_hh(last_time),
                 "label": clicked_label,
                 "note": note.strip(),
                 "logged_at_epoch": time.time(),
             }
         )
-
-        # Persist immediately after logging.
-        state = {
-            "events": st.session_state["events"],
-            "last_time_by_audio": st.session_state["last_time_by_audio"],
-        }
-        _save_state(user_key, state)
+        _persist_now()
 
 st.divider()
 
@@ -197,16 +237,16 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     if st.button("Undo last", width="stretch") and st.session_state["events"]:
         st.session_state["events"].pop()
-        _save_state(user_key, {"events": st.session_state["events"], "last_time_by_audio": st.session_state["last_time_by_audio"]})
+        _persist_now()
 
 with c2:
     if st.button("Clear all", width="stretch"):
         st.session_state["events"] = []
-        _save_state(user_key, {"events": st.session_state["events"], "last_time_by_audio": st.session_state["last_time_by_audio"]})
+        _persist_now()
 
 with c3:
     if st.button("Force save", width="stretch"):
-        _save_state(user_key, {"events": st.session_state["events"], "last_time_by_audio": st.session_state["last_time_by_audio"]})
+        _persist_now()
         st.success("Saved.")
 
 with c4:
