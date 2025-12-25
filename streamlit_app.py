@@ -1,11 +1,11 @@
+import csv
 import io
 import time
 import tempfile
+import hashlib
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
-from streamlit_advanced_audio import audix
 
 st.set_page_config(page_title="Bed Proofing Logger", layout="wide")
 
@@ -21,12 +21,37 @@ def _fmt_time(seconds: float) -> str:
         return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
     return f"{int(m):02d}:{s:06.3f}"
 
+def _write_uploaded_to_temp(uploaded) -> tuple[str, str]:
+    """Return (audio_name, audio_path). Uses a hash so reruns don't rewrite the same file."""
+    audio_name = uploaded.name
+    suffix = Path(audio_name).suffix or ".mp3"
+
+    data = uploaded.getvalue()
+    digest = hashlib.sha1(data).hexdigest()[:16]
+    out_path = Path(tempfile.gettempdir()) / f"proofing_audio_{digest}{suffix}"
+
+    if not out_path.exists():
+        out_path.write_bytes(data)
+
+    return audio_name, str(out_path)
+
+def _events_to_csv_bytes(events: list[dict]) -> bytes:
+    buf = io.StringIO()
+    fieldnames = ["audio_file", "time_sec", "timecode", "label", "note", "logged_at_epoch"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in events:
+        writer.writerow(row)
+    return buf.getvalue().encode("utf-8")
+
 st.title("Proofing Logger (tap-to-mark)")
 
 st.session_state.setdefault("events", [])
 st.session_state.setdefault("audio_name", None)
 st.session_state.setdefault("audio_path", None)
 st.session_state.setdefault("last_time", 0.0)
+
+st.caption("Note: first load on Streamlit Community Cloud can be slow if the app is waking up.")
 
 uploaded = st.file_uploader(
     "Upload audio (MP3/WAV).",
@@ -35,14 +60,10 @@ uploaded = st.file_uploader(
 )
 
 if uploaded is not None:
-    # Save to a temp file so audix can read it as a path.
-    suffix = Path(uploaded.name).suffix or ".mp3"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(uploaded.getbuffer())
-    tmp.close()
-
-    st.session_state["audio_name"] = uploaded.name
-    st.session_state["audio_path"] = tmp.name
+    with st.spinner("Preparing audio…"):
+        audio_name, audio_path = _write_uploaded_to_temp(uploaded)
+        st.session_state["audio_name"] = audio_name
+        st.session_state["audio_path"] = audio_path
 
 audio_path = st.session_state.get("audio_path")
 audio_name = st.session_state.get("audio_name")
@@ -50,9 +71,10 @@ audio_name = st.session_state.get("audio_name")
 if audio_path:
     st.subheader("Player")
 
-    # Call audix before buttons so we capture the latest currentTime
-    # on the same rerun that handles a button press.
-    result = audix(audio_path)
+    # Lazy import so the page can render quickly before heavier JS/component initialisation.
+    with st.spinner("Loading player…"):
+        from streamlit_advanced_audio import audix
+        result = audix(audio_path)
 
     if isinstance(result, dict) and "currentTime" in result:
         st.session_state["last_time"] = float(result["currentTime"])
@@ -68,7 +90,7 @@ if audio_path:
     cols = st.columns(len(LABELS))
     clicked_label = None
     for i, label in enumerate(LABELS):
-        if cols[i].button(label, use_container_width=True):
+        if cols[i].button(label, width="stretch"):
             clicked_label = label
 
     if clicked_label:
@@ -86,24 +108,29 @@ if audio_path:
 st.divider()
 
 st.subheader("Logged issues")
-df = pd.DataFrame(st.session_state["events"])
-st.dataframe(df, use_container_width=True, hide_index=True)
+events = st.session_state["events"]
 
-c1, c2 = st.columns(2)
+if events:
+    st.dataframe(events, width="stretch", hide_index=True)
+else:
+    st.info("No issues logged yet.")
+
+c1, c2, c3 = st.columns(3)
+
 with c1:
-    if st.button("Undo last") and st.session_state["events"]:
+    if st.button("Undo last", width="stretch") and st.session_state["events"]:
         st.session_state["events"].pop()
 
 with c2:
-    if st.button("Clear all"):
+    if st.button("Clear all", width="stretch"):
         st.session_state["events"] = []
 
-if not df.empty:
-    out = io.StringIO()
-    df.to_csv(out, index=False)
-    st.download_button(
-        "Download CSV",
-        data=out.getvalue().encode("utf-8"),
-        file_name="proofing_log.csv",
-        mime="text/csv",
-    )
+with c3:
+    if events:
+        st.download_button(
+            "Download CSV",
+            data=_events_to_csv_bytes(events),
+            file_name="proofing_log.csv",
+            mime="text/csv",
+            width="stretch",
+        )
