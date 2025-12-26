@@ -95,7 +95,8 @@ def _persist_now(user_key: str) -> None:
             "duration_by_audio": st.session_state["duration_by_audio"],
             "audio_files": st.session_state["audio_files"],
             "last_audio_id": st.session_state.get("last_audio_id"),
-            "pending_start_by_audio": st.session_state["pending_start_by_audio"],
+            "player_start_by_audio": st.session_state["player_start_by_audio"],
+            "player_nonce_by_audio": st.session_state["player_nonce_by_audio"],
         },
     )
 
@@ -178,7 +179,18 @@ st.session_state.setdefault("events", state.get("events", []))
 st.session_state.setdefault("last_time_by_audio", state.get("last_time_by_audio", {}))
 st.session_state.setdefault("duration_by_audio", state.get("duration_by_audio", {}))
 st.session_state.setdefault("audio_files", state.get("audio_files", {}))
-st.session_state.setdefault("pending_start_by_audio", state.get("pending_start_by_audio", {}))
+st.session_state.setdefault("player_start_by_audio", state.get("player_start_by_audio", {}))
+st.session_state.setdefault("player_nonce_by_audio", state.get("player_nonce_by_audio", {}))
+# Back-compat: if an older state file had a one-shot pending jump, convert it to a start+nonce bump.
+pending_legacy = state.get("pending_start_by_audio", {})
+if isinstance(pending_legacy, dict) and pending_legacy:
+    for _aid, _t in pending_legacy.items():
+        try:
+            st.session_state["player_start_by_audio"][_aid] = float(_t)
+            st.session_state["player_nonce_by_audio"][_aid] = int(st.session_state["player_nonce_by_audio"].get(_aid, 0)) + 1
+        except Exception:
+            pass
+
 st.session_state.setdefault("last_audio_id", state.get("last_audio_id"))
 
 # -----------------------------
@@ -235,19 +247,26 @@ if audio_id and audio_path:
 
     st.subheader("Player")
 
-    # Jump controls: implemented as a one-shot start_time override.
+    # Jump controls: change a per-audio mount nonce so the player remounts at a new start_time.
+    nonce = int(st.session_state["player_nonce_by_audio"].get(audio_id, 0))
+    start_at = float(st.session_state["player_start_by_audio"].get(audio_id, 0.0))
+
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("Jump to last played time", width="stretch"):
-            st.session_state["pending_start_by_audio"][audio_id] = float(int(last_time))
+            start_at = float(last_time)
+            nonce += 1
+            st.session_state["player_start_by_audio"][audio_id] = start_at
+            st.session_state["player_nonce_by_audio"][audio_id] = nonce
             _persist_now(user_key)
-            st.rerun()
 
     with c2:
         if st.button("Jump to 00:00:00.00", width="stretch"):
-            st.session_state["pending_start_by_audio"][audio_id] = 0.0
+            start_at = 0.0
+            nonce += 1
+            st.session_state["player_start_by_audio"][audio_id] = start_at
+            st.session_state["player_nonce_by_audio"][audio_id] = nonce
             _persist_now(user_key)
-            st.rerun()
 
     with c3:
         if duration is not None:
@@ -255,20 +274,10 @@ if audio_id and audio_path:
         else:
             st.caption(f"Last played: {_fmt_time_hh(last_time)}")
 
-    # IMPORTANT:
-    # Passing start_time on every rerun can override user seeking via the waveform.
-    # So we only pass start_time when a jump has been explicitly requested (pending_start_by_audio).
-    pending = st.session_state["pending_start_by_audio"].get(audio_id)
-
     from streamlit_advanced_audio import audix
 
-    if pending is None:
-        result = audix(audio_path)
-    else:
-        result = audix(audio_path, start_time=pending)
-        # Clear the one-shot override so waveform click/drag seeking works normally afterwards.
-        st.session_state["pending_start_by_audio"].pop(audio_id, None)
-        _persist_now(user_key)
+    player_key = f"audix_{audio_id}_{nonce}"
+    result = audix(audio_path, start_time=start_at, key=player_key)
 
     # If the component reports time, capture it (typically updates on pause/seek/user interaction).
     if isinstance(result, dict) and "currentTime" in result:
