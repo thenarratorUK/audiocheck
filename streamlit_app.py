@@ -2,9 +2,9 @@ import csv
 import io
 import json
 import time
+import tempfile
 import hashlib
 import wave
-import tempfile
 from pathlib import Path
 
 import streamlit as st
@@ -16,7 +16,10 @@ LABELS = ["Breath", "Pop", "Noise", "Click", "Plosive", "Mouth", "Other"]
 
 DATA_ROOT = Path("data")  # best-effort persistence while the Streamlit Cloud container stays alive
 
-def _fmt_time_hh(seconds: float, decimals: int = 2) -> str:
+# -----------------------------
+# Formatting
+# -----------------------------
+def _fmt_time_hh(seconds: float, decimals: int = 3) -> str:
     if seconds is None:
         seconds = 0.0
     seconds = max(0.0, float(seconds))
@@ -34,6 +37,9 @@ def _events_to_csv_bytes(events: list[dict]) -> bytes:
         writer.writerow(row)
     return buf.getvalue().encode("utf-8")
 
+# -----------------------------
+# Persistence
+# -----------------------------
 def _safe_key(s: str) -> str:
     s = (s or "").strip()
     keep = []
@@ -42,21 +48,16 @@ def _safe_key(s: str) -> str:
             keep.append(ch)
     return "".join(keep)[:64]
 
-def _user_dir(user_key: str) -> Path:
-    return DATA_ROOT / user_key
-
 def _state_path(user_key: str) -> Path:
-    return _user_dir(user_key) / "state.json"
+    return DATA_ROOT / user_key / "state.json"
 
 def _default_state() -> dict:
     return {
         "events": [],
-        "last_time_by_audio": {},
-        "duration_by_audio": {},
-        "audio_files": {},             # audio_id -> {"name":..., "path":...} (path in /tmp)
-        "last_audio_id": None,
-        "pending_start_by_audio": {},  # audio_id -> float (apply once on next render)
-        "mount_version_by_audio": {},  # audio_id -> int (forces component remount on jump)
+        "last_played": {  # single "resume hint" for the user
+            "audio_file": None,
+            "time_sec": 0.0,
+        },
     }
 
 def _load_state(user_key: str) -> dict:
@@ -67,6 +68,11 @@ def _load_state(user_key: str) -> dict:
         data = json.loads(p.read_text(encoding="utf-8"))
         for k, v in _default_state().items():
             data.setdefault(k, v)
+        if isinstance(data.get("last_played"), dict):
+            data["last_played"].setdefault("audio_file", None)
+            data["last_played"].setdefault("time_sec", 0.0)
+        else:
+            data["last_played"] = {"audio_file": None, "time_sec": 0.0}
         return data
     except Exception:
         return _default_state()
@@ -83,27 +89,21 @@ def _persist_now(user_key: str) -> None:
         user_key,
         {
             "events": st.session_state["events"],
-            "last_time_by_audio": st.session_state["last_time_by_audio"],
-            "duration_by_audio": st.session_state["duration_by_audio"],
-            "audio_files": st.session_state["audio_files"],
-            "last_audio_id": st.session_state.get("last_audio_id"),
-            "pending_start_by_audio": st.session_state["pending_start_by_audio"],
-            "mount_version_by_audio": st.session_state["mount_version_by_audio"],
+            "last_played": st.session_state["last_played"],
         },
     )
 
-def _hash_upload(name: str, data: bytes) -> str:
-    return hashlib.sha1(name.encode("utf-8") + b"\0" + data).hexdigest()[:16]
-
-def _store_uploaded_audio(uploaded) -> tuple[str, str, str]:
+# -----------------------------
+# Audio utilities (for playback only)
+# -----------------------------
+def _write_uploaded_to_tmp(uploaded) -> tuple[str, str, str]:
+    """Return (audio_name, audio_path, audio_id). Uses a hash so reruns don't rewrite the same file."""
     audio_name = uploaded.name
-    data = uploaded.getvalue()
-    audio_id = _hash_upload(audio_name, data)
+    suffix = Path(audio_name).suffix or ".mp3"
 
-    ext = (Path(audio_name).suffix or ".mp3").lower()
-    out_dir = Path(tempfile.gettempdir()) / "proofing_logger_audio"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{audio_id}{ext}"
+    data = uploaded.getvalue()
+    audio_id = hashlib.sha1(audio_name.encode("utf-8") + b"\0" + data).hexdigest()[:16]
+    out_path = Path(tempfile.gettempdir()) / f"proofing_audio_{audio_id}{suffix.lower()}"
 
     if not out_path.exists():
         out_path.write_bytes(data)
@@ -135,6 +135,9 @@ def _get_duration_seconds(audio_path: str) -> float | None:
 
     return None
 
+# -----------------------------
+# User key gate
+# -----------------------------
 st.title("Proofing Logger (tap-to-mark)")
 
 q = st.query_params
@@ -157,16 +160,21 @@ if not existing_key:
 user_key = _safe_key(existing_key)
 st.caption(f"User key: {user_key}")
 
+# Load persisted state
 state = _load_state(user_key)
-
 st.session_state.setdefault("events", state["events"])
-st.session_state.setdefault("last_time_by_audio", state["last_time_by_audio"])
-st.session_state.setdefault("duration_by_audio", state["duration_by_audio"])
-st.session_state.setdefault("audio_files", state["audio_files"])
-st.session_state.setdefault("pending_start_by_audio", state["pending_start_by_audio"])
-st.session_state.setdefault("mount_version_by_audio", state["mount_version_by_audio"])
-st.session_state.setdefault("last_audio_id", state["last_audio_id"])
+st.session_state.setdefault("last_played", state["last_played"])
 
+# Resume hint (no automation; just a reminder)
+lp = st.session_state["last_played"]
+if lp.get("audio_file"):
+    st.info(f"Last played time: {_fmt_time_hh(lp.get('time_sec', 0.0))} in {lp.get('audio_file')}")
+else:
+    st.info("Last played time: 00:00:00.000 (no file yet)")
+
+# -----------------------------
+# Upload and play
+# -----------------------------
 uploaded = st.file_uploader(
     "Upload audio (MP3/WAV).",
     type=["mp3", "wav", "m4a", "ogg"],
@@ -175,86 +183,25 @@ uploaded = st.file_uploader(
 
 audio_path = None
 audio_name = None
-audio_id = None
+duration = None
+last_time = float(lp.get("time_sec", 0.0)) if lp else 0.0
 
 if uploaded is not None:
-    with st.spinner("Storing audio for refresh-safe playback…"):
-        audio_name, audio_path, audio_id = _store_uploaded_audio(uploaded)
+    with st.spinner("Preparing audio…"):
+        audio_name, audio_path, _ = _write_uploaded_to_tmp(uploaded)
+    duration = _get_duration_seconds(audio_path)
 
-    st.session_state["audio_files"][audio_id] = {"name": audio_name, "path": audio_path}
-    st.session_state["last_audio_id"] = audio_id
-
-    if audio_id not in st.session_state["duration_by_audio"]:
-        with st.spinner("Reading duration…"):
-            dur = _get_duration_seconds(audio_path)
-        if dur is not None:
-            st.session_state["duration_by_audio"][audio_id] = float(dur)
-
-    st.session_state["mount_version_by_audio"].setdefault(audio_id, 0)
-    _persist_now(user_key)
-
-if audio_id is None and st.session_state["audio_files"]:
-    ids = list(st.session_state["audio_files"].keys())
-    last_id = st.session_state.get("last_audio_id")
-    default_idx = ids.index(last_id) if (last_id in ids) else 0
-
-    options = [(aid, st.session_state["audio_files"][aid]["name"]) for aid in ids]
-    labels = [name for _, name in options]
-    picked_name = st.selectbox("Previously stored for this key", labels, index=default_idx)
-
-    picked_id = options[labels.index(picked_name)][0]
-    picked = st.session_state["audio_files"][picked_id]
-    if not Path(picked["path"]).exists():
-        st.warning("That audio file is no longer available on the server. Please re-upload it.")
-    else:
-        audio_id = picked_id
-        audio_name = picked["name"]
-        audio_path = picked["path"]
-        st.session_state["last_audio_id"] = picked_id
-        st.session_state["mount_version_by_audio"].setdefault(audio_id, 0)
-        _persist_now(user_key)
-
-if audio_id and audio_path:
-    last_time = float(st.session_state["last_time_by_audio"].get(audio_id, 0.0))
-    duration = st.session_state["duration_by_audio"].get(audio_id)
-
+if audio_path:
     st.subheader("Player")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("Jump to last played time", width="stretch"):
-            st.session_state["pending_start_by_audio"][audio_id] = float(int(last_time))
-            st.session_state["mount_version_by_audio"][audio_id] = int(st.session_state["mount_version_by_audio"].get(audio_id, 0)) + 1
-            _persist_now(user_key)
-
-    with c2:
-        if st.button("Jump to 00:00:00.00", width="stretch"):
-            st.session_state["pending_start_by_audio"][audio_id] = 0.0
-            st.session_state["mount_version_by_audio"][audio_id] = int(st.session_state["mount_version_by_audio"].get(audio_id, 0)) + 1
-            _persist_now(user_key)
-
-    with c3:
-        if duration is not None:
-            st.caption(f"Last played: {_fmt_time_hh(last_time)} / {_fmt_time_hh(duration)}")
-        else:
-            st.caption(f"Last played: {_fmt_time_hh(last_time)}")
-
-    pending = st.session_state["pending_start_by_audio"].get(audio_id)
-    mount_v = int(st.session_state["mount_version_by_audio"].get(audio_id, 0))
-    player_key = f"audix_{audio_id}_{mount_v}"
 
     from streamlit_advanced_audio import audix
 
-    if pending is None:
-        result = audix(audio_path, key=player_key)
-    else:
-        result = audix(audio_path, start_time=pending, key=player_key)
-        st.session_state["pending_start_by_audio"].pop(audio_id, None)
-        _persist_now(user_key)
+    result = audix(audio_path)
 
+    # Update last_time from the component when available (usually on pause/seek/user interaction).
     if isinstance(result, dict) and "currentTime" in result:
         last_time = float(result["currentTime"])
-        st.session_state["last_time_by_audio"][audio_id] = last_time
+        st.session_state["last_played"] = {"audio_file": audio_name, "time_sec": last_time}
         _persist_now(user_key)
 
     if duration is not None:
@@ -282,10 +229,14 @@ if audio_id and audio_path:
                 "logged_at_epoch": time.time(),
             }
         )
+        st.session_state["last_played"] = {"audio_file": audio_name, "time_sec": float(last_time)}
         _persist_now(user_key)
 
 st.divider()
 
+# -----------------------------
+# Logged issues
+# -----------------------------
 st.subheader("Logged issues")
 events = st.session_state["events"]
 
@@ -294,7 +245,7 @@ if events:
 else:
     st.info("No issues logged yet.")
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 
 with c1:
     if st.button("Undo last", width="stretch") and st.session_state["events"]:
@@ -307,11 +258,6 @@ with c2:
         _persist_now(user_key)
 
 with c3:
-    if st.button("Force save", width="stretch"):
-        _persist_now(user_key)
-        st.success("Saved.")
-
-with c4:
     if events:
         st.download_button(
             "Download CSV",
@@ -321,4 +267,4 @@ with c4:
             width="stretch",
         )
 
-st.caption("Tip: bookmark this page URL — it includes your user key, so refresh will restore your log and your uploaded audio.")
+st.caption("Tip: bookmark this page URL — it includes your user key, so refresh will restore your log and last-played reminder.")
