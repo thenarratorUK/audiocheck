@@ -7,6 +7,7 @@ import hashlib
 import wave
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 from mutagen import File as MutagenFile
 
@@ -17,9 +18,9 @@ LABELS = ["Breath", "Pop", "Noise", "Click", "Plosive", "Mouth", "Other"]
 DATA_ROOT = Path("data")  # best-effort persistence while the Streamlit Cloud container stays alive
 
 # -----------------------------
-# Formatting
+# Formatting / parsing
 # -----------------------------
-def _fmt_time_hh(seconds: float, decimals: int = 3) -> str:
+def fmt_time_hh(seconds: float, decimals: int = 3) -> str:
     if seconds is None:
         seconds = 0.0
     seconds = max(0.0, float(seconds))
@@ -28,7 +29,31 @@ def _fmt_time_hh(seconds: float, decimals: int = 3) -> str:
     s_fmt = f"{s:0{2 + 1 + decimals}.{decimals}f}"
     return f"{int(h):02d}:{int(m):02d}:{s_fmt}"
 
-def _events_to_csv_bytes(events: list[dict]) -> bytes:
+def parse_timecode_to_seconds(tc: str) -> float | None:
+    tc = (tc or "").strip()
+    if not tc:
+        return None
+
+    parts = tc.split(":")
+    try:
+        if len(parts) == 3:
+            h = int(parts[0])
+            m = int(parts[1])
+            s = float(parts[2])
+            return h * 3600.0 + m * 60.0 + s
+        if len(parts) == 2:
+            m = int(parts[0])
+            s = float(parts[1])
+            return m * 60.0 + s
+    except ValueError:
+        pass
+
+    try:
+        return float(tc)
+    except ValueError:
+        return None
+
+def events_to_csv_bytes(events: list[dict]) -> bytes:
     buf = io.StringIO()
     fieldnames = ["audio_file", "time_sec", "timecode", "label", "note", "logged_at_epoch"]
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
@@ -40,7 +65,7 @@ def _events_to_csv_bytes(events: list[dict]) -> bytes:
 # -----------------------------
 # Persistence
 # -----------------------------
-def _safe_key(s: str) -> str:
+def safe_key(s: str) -> str:
     s = (s or "").strip()
     keep = []
     for ch in s:
@@ -48,44 +73,45 @@ def _safe_key(s: str) -> str:
             keep.append(ch)
     return "".join(keep)[:64]
 
-def _state_path(user_key: str) -> Path:
+def state_path(user_key: str) -> Path:
     return DATA_ROOT / user_key / "state.json"
 
-def _default_state() -> dict:
+def default_state() -> dict:
     return {
         "events": [],
-        "last_played": {  # single "resume hint" for the user
+        "last_played": {
             "audio_file": None,
             "time_sec": 0.0,
         },
     }
 
-def _load_state(user_key: str) -> dict:
-    p = _state_path(user_key)
+def load_state(user_key: str) -> dict:
+    p = state_path(user_key)
     if not p.exists():
-        return _default_state()
+        return default_state()
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        for k, v in _default_state().items():
+        for k, v in default_state().items():
             data.setdefault(k, v)
-        if isinstance(data.get("last_played"), dict):
-            data["last_played"].setdefault("audio_file", None)
-            data["last_played"].setdefault("time_sec", 0.0)
-        else:
+        if not isinstance(data.get("last_played"), dict):
             data["last_played"] = {"audio_file": None, "time_sec": 0.0}
+        data["last_played"].setdefault("audio_file", None)
+        data["last_played"].setdefault("time_sec", 0.0)
+        if not isinstance(data.get("events"), list):
+            data["events"] = []
         return data
     except Exception:
-        return _default_state()
+        return default_state()
 
-def _save_state(user_key: str, state: dict) -> None:
-    p = _state_path(user_key)
+def save_state(user_key: str, state: dict) -> None:
+    p = state_path(user_key)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(p)
 
-def _persist_now(user_key: str) -> None:
-    _save_state(
+def persist_now(user_key: str) -> None:
+    save_state(
         user_key,
         {
             "events": st.session_state["events"],
@@ -94,10 +120,9 @@ def _persist_now(user_key: str) -> None:
     )
 
 # -----------------------------
-# Audio utilities (for playback only)
+# Audio utilities (playback only)
 # -----------------------------
-def _write_uploaded_to_tmp(uploaded) -> tuple[str, str, str]:
-    """Return (audio_name, audio_path, audio_id). Uses a hash so reruns don't rewrite the same file."""
+def write_uploaded_to_tmp(uploaded) -> tuple[str, str]:
     audio_name = uploaded.name
     suffix = Path(audio_name).suffix or ".mp3"
 
@@ -108,9 +133,9 @@ def _write_uploaded_to_tmp(uploaded) -> tuple[str, str, str]:
     if not out_path.exists():
         out_path.write_bytes(data)
 
-    return audio_name, str(out_path), audio_id
+    return audio_name, str(out_path)
 
-def _get_duration_seconds(audio_path: str) -> float | None:
+def get_duration_seconds(audio_path: str) -> float | None:
     p = Path(audio_path)
     ext = p.suffix.lower()
 
@@ -136,7 +161,7 @@ def _get_duration_seconds(audio_path: str) -> float | None:
     return None
 
 # -----------------------------
-# User key gate
+# App
 # -----------------------------
 st.title("Proofing Logger (tap-to-mark)")
 
@@ -149,7 +174,7 @@ if not existing_key:
     col_a, col_b = st.columns([1, 3])
     with col_a:
         if st.button("Continue", width="stretch"):
-            k = _safe_key(entered)
+            k = safe_key(entered)
             if not k:
                 st.error("User key must contain at least one letter/number.")
             else:
@@ -157,24 +182,22 @@ if not existing_key:
                 st.rerun()
     st.stop()
 
-user_key = _safe_key(existing_key)
+user_key = safe_key(existing_key)
 st.caption(f"User key: {user_key}")
 
-# Load persisted state
-state = _load_state(user_key)
+state = load_state(user_key)
 st.session_state.setdefault("events", state["events"])
 st.session_state.setdefault("last_played", state["last_played"])
 
-# Resume hint (no automation; just a reminder)
 lp = st.session_state["last_played"]
-if lp.get("audio_file"):
-    st.info(f"Last played time: {_fmt_time_hh(lp.get('time_sec', 0.0))} in {lp.get('audio_file')}")
+lp_file = lp.get("audio_file")
+lp_time = float(lp.get("time_sec", 0.0) or 0.0)
+
+if lp_file:
+    st.info(f"Last played time: {fmt_time_hh(lp_time)} in {lp_file}")
 else:
     st.info("Last played time: 00:00:00.000 (no file yet)")
 
-# -----------------------------
-# Upload and play
-# -----------------------------
 uploaded = st.file_uploader(
     "Upload audio (MP3/WAV).",
     type=["mp3", "wav", "m4a", "ogg"],
@@ -184,12 +207,12 @@ uploaded = st.file_uploader(
 audio_path = None
 audio_name = None
 duration = None
-last_time = float(lp.get("time_sec", 0.0)) if lp else 0.0
+last_time = lp_time
 
 if uploaded is not None:
     with st.spinner("Preparing audio…"):
-        audio_name, audio_path, _ = _write_uploaded_to_tmp(uploaded)
-    duration = _get_duration_seconds(audio_path)
+        audio_name, audio_path = write_uploaded_to_tmp(uploaded)
+    duration = get_duration_seconds(audio_path)
 
 if audio_path:
     st.subheader("Player")
@@ -198,16 +221,15 @@ if audio_path:
 
     result = audix(audio_path)
 
-    # Update last_time from the component when available (usually on pause/seek/user interaction).
     if isinstance(result, dict) and "currentTime" in result:
         last_time = float(result["currentTime"])
         st.session_state["last_played"] = {"audio_file": audio_name, "time_sec": last_time}
-        _persist_now(user_key)
+        persist_now(user_key)
 
     if duration is not None:
-        st.caption(f"Current: {_fmt_time_hh(last_time)} / {_fmt_time_hh(float(duration))}")
+        st.caption(f"Current: {fmt_time_hh(last_time)} / {fmt_time_hh(float(duration))}")
     else:
-        st.caption(f"Current: {_fmt_time_hh(last_time)}")
+        st.caption(f"Current: {fmt_time_hh(last_time)}")
 
     st.subheader("Log an issue")
     note = st.text_input("Optional note", value="", placeholder="e.g., hard T / rustle / long pause")
@@ -223,48 +245,152 @@ if audio_path:
             {
                 "audio_file": audio_name,
                 "time_sec": float(last_time),
-                "timecode": _fmt_time_hh(last_time),
+                "timecode": fmt_time_hh(float(last_time)),
                 "label": clicked_label,
                 "note": note.strip(),
                 "logged_at_epoch": time.time(),
             }
         )
         st.session_state["last_played"] = {"audio_file": audio_name, "time_sec": float(last_time)}
-        _persist_now(user_key)
+        persist_now(user_key)
 
 st.divider()
 
 # -----------------------------
-# Logged issues
+# Logged issues (editable table)
 # -----------------------------
 st.subheader("Logged issues")
+
 events = st.session_state["events"]
 
-if events:
-    st.dataframe(events, width="stretch", hide_index=True)
-else:
+if not events:
     st.info("No issues logged yet.")
+else:
+    df = pd.DataFrame(events)
 
-c1, c2, c3 = st.columns(3)
+    for c in ["audio_file", "time_sec", "timecode", "label", "note", "logged_at_epoch"]:
+        if c not in df.columns:
+            df[c] = ""
 
-with c1:
-    if st.button("Undo last", width="stretch") and st.session_state["events"]:
-        st.session_state["events"].pop()
-        _persist_now(user_key)
+    def repair_timecode(row):
+        tc = str(row.get("timecode", "") or "").strip()
+        if tc:
+            return tc
+        try:
+            return fmt_time_hh(float(row.get("time_sec", 0.0) or 0.0))
+        except Exception:
+            return "00:00:00.000"
 
-with c2:
-    if st.button("Clear all", width="stretch"):
-        st.session_state["events"] = []
-        _persist_now(user_key)
+    df["timecode"] = df.apply(repair_timecode, axis=1)
 
-with c3:
-    if events:
+    if "Delete" not in df.columns:
+        df.insert(0, "Delete", False)
+    else:
+        df["Delete"] = df["Delete"].fillna(False).astype(bool)
+
+    edited = st.data_editor(
+        df,
+        key="events_editor",
+        hide_index=True,
+        num_rows="fixed",
+        width="stretch",
+        disabled=["audio_file", "time_sec", "logged_at_epoch"],
+        column_config={
+            "Delete": st.column_config.CheckboxColumn("Delete", help="Tick and press 'Apply deletions'."),
+            "timecode": st.column_config.TextColumn("timecode", help="Editable. Format HH:MM:SS.mmm (or MM:SS.mmm)."),
+            "label": st.column_config.TextColumn("label"),
+            "note": st.column_config.TextColumn("note"),
+        },
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        if st.button("Apply deletions", width="stretch"):
+            kept = edited[~edited["Delete"].fillna(False).astype(bool)].copy()
+            if "Delete" in kept.columns:
+                kept["Delete"] = False
+
+            new_events = []
+            for _, r in kept.iterrows():
+                tc = str(r.get("timecode", "") or "").strip()
+                sec = parse_timecode_to_seconds(tc)
+                if sec is None:
+                    try:
+                        sec = float(r.get("time_sec", 0.0) or 0.0)
+                    except Exception:
+                        sec = 0.0
+
+                new_events.append(
+                    {
+                        "audio_file": str(r.get("audio_file", "") or ""),
+                        "time_sec": float(sec),
+                        "timecode": fmt_time_hh(float(sec)),
+                        "label": str(r.get("label", "") or ""),
+                        "note": str(r.get("note", "") or ""),
+                        "logged_at_epoch": float(r.get("logged_at_epoch", 0.0) or 0.0),
+                    }
+                )
+
+            st.session_state["events"] = new_events
+            persist_now(user_key)
+            st.rerun()
+
+    with c2:
+        if st.button("Undo last", width="stretch") and st.session_state["events"]:
+            st.session_state["events"].pop()
+            persist_now(user_key)
+            st.rerun()
+
+    with c3:
+        if st.button("Clear all", width="stretch"):
+            st.session_state["events"] = []
+            persist_now(user_key)
+            st.rerun()
+
+    with c4:
         st.download_button(
             "Download CSV",
-            data=_events_to_csv_bytes(events),
+            data=events_to_csv_bytes(st.session_state["events"]),
             file_name="proofing_log.csv",
             mime="text/csv",
             width="stretch",
         )
+
+    def normalise_for_compare(frame: pd.DataFrame) -> pd.DataFrame:
+        f = frame.copy()
+        if "Delete" in f.columns:
+            f = f.drop(columns=["Delete"])
+        return f.fillna("")
+
+    try:
+        current_df = normalise_for_compare(df)
+        edited_df = normalise_for_compare(edited)
+        if not current_df.equals(edited_df):
+            new_events = []
+            for _, r in edited_df.iterrows():
+                tc = str(r.get("timecode", "") or "").strip()
+                sec = parse_timecode_to_seconds(tc)
+                if sec is None:
+                    try:
+                        sec = float(r.get("time_sec", 0.0) or 0.0)
+                    except Exception:
+                        sec = 0.0
+
+                new_events.append(
+                    {
+                        "audio_file": str(r.get("audio_file", "") or ""),
+                        "time_sec": float(sec),
+                        "timecode": fmt_time_hh(float(sec)),
+                        "label": str(r.get("label", "") or ""),
+                        "note": str(r.get("note", "") or ""),
+                        "logged_at_epoch": float(r.get("logged_at_epoch", 0.0) or 0.0),
+                    }
+                )
+
+            st.session_state["events"] = new_events
+            persist_now(user_key)
+    except Exception:
+        pass
 
 st.caption("Tip: bookmark this page URL — it includes your user key, so refresh will restore your log and last-played reminder.")
