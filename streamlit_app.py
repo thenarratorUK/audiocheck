@@ -29,6 +29,11 @@ def fmt_time_hh(seconds: float, decimals: int = 3) -> str:
     s_fmt = f"{s:0{2 + 1 + decimals}.{decimals}f}"
     return f"{int(h):02d}:{int(m):02d}:{s_fmt}"
 
+def fmt_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "??:??:??.???"
+    return fmt_time_hh(seconds)
+
 def parse_timecode_to_seconds(tc: str) -> float | None:
     tc = (tc or "").strip()
     if not tc:
@@ -63,7 +68,7 @@ def events_to_csv_bytes(events: list[dict]) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 # -----------------------------
-# Persistence
+# Persistence (events + last played hint only)
 # -----------------------------
 def safe_key(s: str) -> str:
     s = (s or "").strip()
@@ -120,20 +125,23 @@ def persist_now(user_key: str) -> None:
     )
 
 # -----------------------------
-# Audio utilities (playback only)
+# Audio utilities (session-only)
 # -----------------------------
-def write_uploaded_to_tmp(uploaded) -> tuple[str, str]:
+def _hash_upload(name: str, data: bytes) -> str:
+    return hashlib.sha1(name.encode("utf-8") + b"\0" + data).hexdigest()[:16]
+
+def write_uploaded_to_tmp(uploaded) -> tuple[str, str, str]:
     audio_name = uploaded.name
     suffix = Path(audio_name).suffix or ".mp3"
 
     data = uploaded.getvalue()
-    audio_id = hashlib.sha1(audio_name.encode("utf-8") + b"\0" + data).hexdigest()[:16]
-    out_path = Path(tempfile.gettempdir()) / f"proofing_audio_{audio_id}{suffix.lower()}"
+    audio_id = _hash_upload(audio_name, data)
 
+    out_path = Path(tempfile.gettempdir()) / f"proofing_audio_{audio_id}{suffix.lower()}"
     if not out_path.exists():
         out_path.write_bytes(data)
 
-    return audio_name, str(out_path)
+    return audio_name, str(out_path), audio_id
 
 def get_duration_seconds(audio_path: str) -> float | None:
     p = Path(audio_path)
@@ -189,6 +197,10 @@ state = load_state(user_key)
 st.session_state.setdefault("events", state["events"])
 st.session_state.setdefault("last_played", state["last_played"])
 
+# Session-only uploaded audio catalogue
+st.session_state.setdefault("uploaded_audio", {})  # audio_id -> {"name":..., "path":..., "duration":...}
+st.session_state.setdefault("active_audio_id", None)
+
 lp = st.session_state["last_played"]
 lp_file = lp.get("audio_file")
 lp_time = float(lp.get("time_sec", 0.0) or 0.0)
@@ -198,21 +210,65 @@ if lp_file:
 else:
     st.info("Last played time: 00:00:00.000 (no file yet)")
 
-uploaded = st.file_uploader(
-    "Upload audio (MP3/WAV).",
+uploaded_files = st.file_uploader(
+    "Upload audio (MP3/WAV) — you can select multiple files.",
     type=["mp3", "wav", "m4a", "ogg"],
-    accept_multiple_files=False,
+    accept_multiple_files=True,
 )
 
-audio_path = None
-audio_name = None
-duration = None
-last_time = lp_time
-
-if uploaded is not None:
+if uploaded_files:
     with st.spinner("Preparing audio…"):
-        audio_name, audio_path = write_uploaded_to_tmp(uploaded)
-    duration = get_duration_seconds(audio_path)
+        newest = None
+        for up in uploaded_files:
+            audio_name, audio_path, audio_id = write_uploaded_to_tmp(up)
+            newest = audio_id
+            if audio_id not in st.session_state["uploaded_audio"]:
+                dur = get_duration_seconds(audio_path)
+                st.session_state["uploaded_audio"][audio_id] = {
+                    "name": audio_name,
+                    "path": audio_path,
+                    "duration": dur,
+                }
+
+    if newest and newest in st.session_state["uploaded_audio"]:
+        st.session_state["active_audio_id"] = newest
+
+catalog = st.session_state["uploaded_audio"]
+if catalog:
+    durations = [v.get("duration") for v in catalog.values() if isinstance(v.get("duration"), (int, float))]
+    total = float(sum(durations)) if durations else None
+
+    st.subheader("Uploaded files (this session)")
+    st.caption(
+        f"Files: {len(catalog)}"
+        + (f" • Total duration: {fmt_duration(total)}" if total is not None else " • Total duration: unknown")
+    )
+
+    items = sorted(catalog.items(), key=lambda kv: kv[1]["name"].lower())
+    labels = []
+    ids = []
+    for aid, meta in items:
+        labels.append(f'{meta["name"]} — {fmt_duration(meta.get("duration"))}')
+        ids.append(aid)
+
+    active_id = st.session_state.get("active_audio_id")
+    default_idx = ids.index(active_id) if active_id in ids else 0
+    if active_id not in ids:
+        st.session_state["active_audio_id"] = ids[0]
+
+    picked_label = st.selectbox("Choose file to play", labels, index=default_idx)
+    picked_id = ids[labels.index(picked_label)]
+    st.session_state["active_audio_id"] = picked_id
+
+    audio_name = catalog[picked_id]["name"]
+    audio_path = catalog[picked_id]["path"]
+    duration = catalog[picked_id].get("duration")
+else:
+    audio_name = None
+    audio_path = None
+    duration = None
+
+last_time = lp_time
 
 if audio_path:
     st.subheader("Player")
@@ -256,9 +312,6 @@ if audio_path:
 
 st.divider()
 
-# -----------------------------
-# Logged issues (editable table)
-# -----------------------------
 st.subheader("Logged issues")
 
 events = st.session_state["events"]
@@ -305,34 +358,35 @@ else:
 
     c1, c2, c3, c4 = st.columns(4)
 
+    def rebuild_events_from_frame(frame: pd.DataFrame) -> list[dict]:
+        new_events = []
+        for _, r in frame.iterrows():
+            tc = str(r.get("timecode", "") or "").strip()
+            sec = parse_timecode_to_seconds(tc)
+            if sec is None:
+                try:
+                    sec = float(r.get("time_sec", 0.0) or 0.0)
+                except Exception:
+                    sec = 0.0
+
+            new_events.append(
+                {
+                    "audio_file": str(r.get("audio_file", "") or ""),
+                    "time_sec": float(sec),
+                    "timecode": fmt_time_hh(float(sec)),
+                    "label": str(r.get("label", "") or ""),
+                    "note": str(r.get("note", "") or ""),
+                    "logged_at_epoch": float(r.get("logged_at_epoch", 0.0) or 0.0),
+                }
+            )
+        return new_events
+
     with c1:
         if st.button("Apply deletions", width="stretch"):
             kept = edited[~edited["Delete"].fillna(False).astype(bool)].copy()
             if "Delete" in kept.columns:
-                kept["Delete"] = False
-
-            new_events = []
-            for _, r in kept.iterrows():
-                tc = str(r.get("timecode", "") or "").strip()
-                sec = parse_timecode_to_seconds(tc)
-                if sec is None:
-                    try:
-                        sec = float(r.get("time_sec", 0.0) or 0.0)
-                    except Exception:
-                        sec = 0.0
-
-                new_events.append(
-                    {
-                        "audio_file": str(r.get("audio_file", "") or ""),
-                        "time_sec": float(sec),
-                        "timecode": fmt_time_hh(float(sec)),
-                        "label": str(r.get("label", "") or ""),
-                        "note": str(r.get("note", "") or ""),
-                        "logged_at_epoch": float(r.get("logged_at_epoch", 0.0) or 0.0),
-                    }
-                )
-
-            st.session_state["events"] = new_events
+                kept = kept.drop(columns=["Delete"])
+            st.session_state["events"] = rebuild_events_from_frame(kept)
             persist_now(user_key)
             st.rerun()
 
@@ -367,28 +421,7 @@ else:
         current_df = normalise_for_compare(df)
         edited_df = normalise_for_compare(edited)
         if not current_df.equals(edited_df):
-            new_events = []
-            for _, r in edited_df.iterrows():
-                tc = str(r.get("timecode", "") or "").strip()
-                sec = parse_timecode_to_seconds(tc)
-                if sec is None:
-                    try:
-                        sec = float(r.get("time_sec", 0.0) or 0.0)
-                    except Exception:
-                        sec = 0.0
-
-                new_events.append(
-                    {
-                        "audio_file": str(r.get("audio_file", "") or ""),
-                        "time_sec": float(sec),
-                        "timecode": fmt_time_hh(float(sec)),
-                        "label": str(r.get("label", "") or ""),
-                        "note": str(r.get("note", "") or ""),
-                        "logged_at_epoch": float(r.get("logged_at_epoch", 0.0) or 0.0),
-                    }
-                )
-
-            st.session_state["events"] = new_events
+            st.session_state["events"] = rebuild_events_from_frame(edited_df)
             persist_now(user_key)
     except Exception:
         pass
