@@ -201,6 +201,9 @@ st.session_state.setdefault("last_played", state["last_played"])
 st.session_state.setdefault("uploaded_audio", {})  # audio_id -> {"name":..., "path":..., "duration":...}
 st.session_state.setdefault("active_audio_id", None)
 
+# Note input is per-session; clear after logging.
+st.session_state.setdefault("note_input", "")
+
 lp = st.session_state["last_played"]
 lp_file = lp.get("audio_file")
 lp_time = float(lp.get("time_sec", 0.0) or 0.0)
@@ -220,13 +223,13 @@ if uploaded_files:
     with st.spinner("Preparing audio…"):
         newest = None
         for up in uploaded_files:
-            audio_name, audio_path, audio_id = write_uploaded_to_tmp(up)
+            audio_name_tmp, audio_path_tmp, audio_id = write_uploaded_to_tmp(up)
             newest = audio_id
             if audio_id not in st.session_state["uploaded_audio"]:
-                dur = get_duration_seconds(audio_path)
+                dur = get_duration_seconds(audio_path_tmp)
                 st.session_state["uploaded_audio"][audio_id] = {
-                    "name": audio_name,
-                    "path": audio_path,
+                    "name": audio_name_tmp,
+                    "path": audio_path_tmp,
                     "duration": dur,
                 }
 
@@ -288,7 +291,13 @@ if audio_path:
         st.caption(f"Current: {fmt_time_hh(last_time)}")
 
     st.subheader("Log an issue")
-    note = st.text_input("Optional note", value="", placeholder="e.g., hard T / rustle / long pause")
+
+    # Keyed input so we can clear it after logging.
+    st.text_input(
+        "Optional note",
+        key="note_input",
+        placeholder="e.g., hard T / rustle / long pause",
+    )
 
     cols = st.columns(len(LABELS))
     clicked_label = None
@@ -297,16 +306,22 @@ if audio_path:
             clicked_label = label
 
     if clicked_label:
+        note_text = (st.session_state.get("note_input") or "").strip()
+
         st.session_state["events"].append(
             {
                 "audio_file": audio_name,
                 "time_sec": float(last_time),
                 "timecode": fmt_time_hh(float(last_time)),
                 "label": clicked_label,
-                "note": note.strip(),
+                "note": note_text,
                 "logged_at_epoch": time.time(),
             }
         )
+
+        # Clear note after use.
+        st.session_state["note_input"] = ""
+
         st.session_state["last_played"] = {"audio_file": audio_name, "time_sec": float(last_time)}
         persist_now(user_key)
 
