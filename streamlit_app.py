@@ -201,8 +201,9 @@ st.session_state.setdefault("last_played", state["last_played"])
 st.session_state.setdefault("uploaded_audio", {})  # audio_id -> {"name":..., "path":..., "duration":...}
 st.session_state.setdefault("active_audio_id", None)
 
-# Note input is per-session; clear after logging.
+# Note input is per-session; clear after logging via a one-shot flag.
 st.session_state.setdefault("note_input", "")
+st.session_state.setdefault("clear_note_next", False)
 
 lp = st.session_state["last_played"]
 lp_file = lp.get("audio_file")
@@ -292,7 +293,11 @@ if audio_path:
 
     st.subheader("Log an issue")
 
-    # Keyed input so we can clear it after logging.
+    # Clear note *before* widget instantiation on the first rerun after a log.
+    if st.session_state.get("clear_note_next"):
+        st.session_state["note_input"] = ""
+        st.session_state["clear_note_next"] = False
+
     st.text_input(
         "Optional note",
         key="note_input",
@@ -319,11 +324,12 @@ if audio_path:
             }
         )
 
-        # Clear note after use.
-        st.session_state["note_input"] = ""
+        # Defer clearing until the next rerun (so we don't mutate the widget's key after instantiation).
+        st.session_state["clear_note_next"] = True
 
         st.session_state["last_played"] = {"audio_file": audio_name, "time_sec": float(last_time)}
         persist_now(user_key)
+        st.rerun()
 
 st.divider()
 
