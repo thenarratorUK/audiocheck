@@ -13,7 +13,17 @@ from mutagen import File as MutagenFile
 
 st.set_page_config(page_title="Bed Proofing Logger", layout="wide")
 
-LABELS = ["Breath", "Pop", "Noise", "Click", "Plosive", "Mouth", "Other"]
+LABELS = [
+    "Loud Breath",
+    "Distortion",
+    "Enunciation",
+    "Noise",
+    "Long Pause",
+    "Plosive",
+    "Pop/Click",
+    "Pronunciation",
+    "Other",
+]
 
 DATA_ROOT = Path("data")  # best-effort persistence while the Streamlit Cloud container stays alive
 
@@ -304,10 +314,11 @@ if audio_path:
         placeholder="e.g., hard T / rustle / long pause",
     )
 
-    cols = st.columns(len(LABELS))
+    # Compact buttons: content width (not stretched) so they can fit more densely.
+    cols = st.columns(len(LABELS), gap="small")
     clicked_label = None
     for i, label in enumerate(LABELS):
-        if cols[i].button(label, width="stretch"):
+        if cols[i].button(label, width="content"):
             clicked_label = label
 
     if clicked_label:
