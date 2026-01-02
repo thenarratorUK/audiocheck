@@ -314,11 +314,12 @@ if audio_path:
         placeholder="e.g., hard T / rustle / long pause",
     )
 
-    # Compact buttons: content width (not stretched) so they can fit more densely.
-    cols = st.columns(len(LABELS), gap="small")
+    # Horizontal flex container for buttons (avoids st.columns stacking on mobile).
+    flex = st.container(horizontal=True, gap=None)
+
     clicked_label = None
-    for i, label in enumerate(LABELS):
-        if cols[i].button(label, width="content"):
+    for label in LABELS:
+        if flex.button(label, key=f"pickup_{label}", width="content"):
             clicked_label = label
 
     if clicked_label:
