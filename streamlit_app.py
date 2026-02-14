@@ -44,21 +44,17 @@ def fmt_duration(seconds: float | None) -> str:
         return "??:??:??.???"
     return fmt_time_hh(seconds)
 
-def render_brand_header():
-    """Render the brand header (text left, logo right) if logo.png is present beside this script."""
-    left, right = st.columns([4, 1])
+def render_brand_header(logo_width_px: int = 90):
+    """Render the brand header (logo left, text right) if logo.png is present beside this script."""
+    left, right = st.columns([1, 4], vertical_alignment="center")
 
     with left:
-        st.markdown('Created by David Winter ("The Narrator")  \nhttps://www.thenarrator.co.uk')
-
-    with right:
         logo_path = Path(__file__).with_name("logo.png")
         if logo_path.exists():
-            # Newer Streamlit: width="stretch". Older: use_container_width=True.
-            try:
-                st.image(str(logo_path), width="stretch")
-            except TypeError:
-                st.image(str(logo_path), use_container_width=True)
+            st.image(str(logo_path), width=logo_width_px)
+
+    with right:
+        st.markdown('Created by David Winter ("The Narrator")  \nhttps://www.thenarrator.co.uk')
 
     st.markdown("---")
     
