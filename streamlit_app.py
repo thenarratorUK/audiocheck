@@ -54,7 +54,7 @@ def render_brand_header(logo_width_px: int = 200):
             st.image(str(logo_path), width=logo_width_px)
 
     with right:
-        st.markdown('Created by David Winter\n("The Narrator")\nhttps://www.thenarrator.co.uk')
+        st.markdown('Created by David Winter  \n("The Narrator")  \nhttps://www.thenarrator.co.uk')
 
     st.markdown("---")
     
