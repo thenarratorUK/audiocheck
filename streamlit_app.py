@@ -6,6 +6,7 @@ import tempfile
 import hashlib
 import wave
 from pathlib import Path
+from streamlit_theme import st_theme
 
 import pandas as pd
 import streamlit as st
