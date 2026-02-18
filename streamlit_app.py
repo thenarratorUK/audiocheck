@@ -46,13 +46,20 @@ def fmt_duration(seconds: float | None) -> str:
     return fmt_time_hh(seconds)
 
 def render_brand_header(logo_width_px: int = 200):
-    """Render the brand header (logo left, text right) if logo.png is present beside this script."""
-    left, middle, right = st.columns([1, 3, 1], vertical_alignment="center")
+    """Render the brand header (logo left, text right). Uses logo_alt.png when Streamlit theme is dark."""
+    left, middle, right = st.columns([1, 1, 1], vertical_alignment="center")
 
     with left:
         logo_path = Path(__file__).with_name("logo.png")
+        logo_alt_path = Path(__file__).with_name("logo_alt.png")
+
         if logo_path.exists():
-            st.image(str(logo_path), width=logo_width_px)
+            theme = st_theme() or {}
+            base = (theme.get("base") or "").lower()
+
+            # If Streamlit is in dark mode and alt logo exists, use it; otherwise use default.
+            chosen = logo_alt_path if (base == "dark" and logo_alt_path.exists()) else logo_path
+            st.image(str(chosen), width=logo_width_px)
 
     with right:
         st.markdown('Created by David Winter  \n("The Narrator")  \nhttps://www.thenarrator.co.uk')
